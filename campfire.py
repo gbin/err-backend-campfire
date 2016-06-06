@@ -1,12 +1,11 @@
 import logging
 import sys
+from time import sleep
 
 from errbot.backends.base import Message, Room, Identifier
 from errbot.errBot import ErrBot
 from errbot.rendering import text
 from errbot.rendering.ansiext import enable_format, TEXT_CHRS
-
-from threading import Condition
 
 log = logging.getLogger(u'errbot.backends.campfire')
 
@@ -22,18 +21,20 @@ except ImportError:
 
 
 class CampfireConnection(pyfire.Campfire):
-    rooms = {}  # keep track of joined room so we can send messages directly to them
 
-    def join_room(self, name, msg_callback, error_callback):
-        room = self.get_room_by_name(name)
+    rooms = {}
+    def join_room(self, room, msg_callback, error_callback):
         room.join()
         stream = room.get_stream(error_callback=error_callback)
         stream.attach(msg_callback).start()
-        self.rooms[name] = (room, stream)
+        self.rooms[room.name] = (room, stream)
+        log.debug("CampfireConnection:join_room(): {}".format(self.rooms))
 
+    def is_streaming(self, name):
+        stream = self.rooms[name][1]
+        return stream.is_streaming()
 
 ENCODING_INPUT = sys.stdin.encoding
-
 
 class CampfireIdentifier(Identifier):
     def __init__(self, user):
@@ -48,35 +49,16 @@ class CampfireIdentifier(Identifier):
         return self._user
 
 class CampfireRoom(Room):
-    def __init__(self, bot, room):
+    def __init__(self, bot, roomname):
         self.conn = bot.conn
-        self.room = self.conn.get_room_by_name(room)
-        self.bot_identifier = bot.bot_identifier
+        self.room = self.conn.get_room_by_name(roomname)
         self.bot = bot
 
     def join(self, username=None, password=None):
-        log.debug("Joining room {}".format(self.room))
-        self.conn.join_room(self.room.name, self.msg_callback, self.error_callback)
-
-    def msg_callback(self, message):
-        log.debug('Incoming message [%s]' % message)
-        user = ""
-        if message.user:
-            user = message.user.name
-        if message.is_text():
-            msg = Message(message.body)  # it is always a groupchat in campfire
-            msg.frm = CampfireIdentifier(user)
-            msg.to = self.bot_identifier  # assume it is for me
-            self.bot.callback_message(msg)
-
-    def error_callback(self, error, room):
-        log.error("Stream STOPPED due to ERROR: %s in room %s" % (error, room))
-        self.exit_lock.acquire()
-        self.exit_lock.notify()
-        self.exit_lock.release()
+        log.debug("Joining room {}".format(self.room.name))
+        self.conn.join_room(self.room, self.bot._msg_callback, self.bot._error_callback)
 
 class CampfireBackend(ErrBot):
-    exit_lock = Condition()
 
     def __init__(self, config):
         super(CampfireBackend, self).__init__(config)
@@ -98,57 +80,47 @@ class CampfireBackend(ErrBot):
     def send_message(self, mess):
         super(CampfireBackend, self).send_message(mess)
         body = self.md_converter.convert(mess.body)
-        log.debug("Sending message {}".format(mess))
         try:
             self.room.speak(body)  # Basic text support for the moment
         except Exception:
-            log.excetion(
+            log.exception(
                 "An exception occurred while trying to send the following message "
-                "to %s: %s" % (mess.to.id, mess.body)
+                "to %s: %s" % (mess.to, mess.body)
             )
             raise
 
     def serve_forever(self):
-        self.exit_lock.acquire()
+        log.info("Initializing Campfire connection")
         self.connect()  # be sure we are "connected" before the first command
         self.connect_callback()  # notify that the connection occured
+        log.info("Campfire connected.")
         try:
-            log.info("Campfire connected.")
-            self.exit_lock.wait()
+            while True:
+                if self.conn.is_streaming(self.chatroom):
+                    sleep(1)
+                else:
+                    log.error("Default Campfire room {} is not connected, retrying...".format(self.chatroom))
         except KeyboardInterrupt:
-            self.exit_lock.release()
+            log.info("Interrupt received, disconnecting...")
+        finally:
+            log.debug("Triggering disconnect callback")
             self.disconnect_callback()
             self.shutdown()
 
     def connect(self):
+        self.bot_identifier = self.build_identifier(self.username)
         if not self.conn:
             self.conn = CampfireConnection(self.subdomain, self.username, self.password, self.ssl)
-            self.bot_identifier = self.build_identifier(self.username)
-            self.room = self.conn.get_room_by_name(self.chatroom)
-            self.room.join()
-            # put us by default in the first room
-            # resource emulates the XMPP behavior in chatrooms
         return self.conn
 
     def build_message(self, text):
-        return Message(text)  # it is always a groupchat in campfire
+        return Message(text)
 
     def shutdown(self):
         super(CampfireBackend, self).shutdown()
 
-    def msg_callback(self, message):
-        log.debug('Incoming message [%s]' % message)
-        user = ""
-        if message.user:
-            user = message.user.name
-        if message.is_text():
-            msg = Message(message.body, type_='groupchat')  # it is always a groupchat in campfire
-            msg.frm = CampfireIdentifier(user)
-            msg.to = self.bot_identifier  # assume it is for me
-            self.callback_message(msg)
-
-    def build_identifier(self, strrep):
-        return CampfireIdentifier(strrep)
+    def build_identifier(self, txtrep):
+        return CampfireIdentifier(txtrep)
 
     def send_simple_reply(self, mess, text, private=False):
         """Total hack to avoid stripping of rooms"""
@@ -166,17 +138,31 @@ class CampfireBackend(ErrBot):
         log.debug("I have no idea what I am doing")
         pass
 
-    def query_room(self, room):
-        log.debug("query_room: I have no idea what I am doing")
-        return CampfireRoom(self, room)
+    def query_room(self, roomname):
+        log.debug("query_room: querying room {} for info".format(roomname))
+        return CampfireRoom(self, roomname)
 
     def change_presence(self):
         log.debug("I have no idea what I am doing")
         pass
 
     def build_reply(self, mess, text=None, private=False):
-        log.debug("build_reply: I have no idea what I am doing")
         response = self.build_message(text)
         response.frm = self.bot_identifier
         response.to = mess.frm
         return response
+
+    def _msg_callback(self, message):
+        user = ""
+        if message.user:
+            user = message.user.name
+        self.room = message.room # message.room will be always set in Campfire
+        #message.is_by_current_user() lead to weird race conditions :\
+        if message.is_text():
+            msg = Message(message.body)
+            msg.frm = CampfireIdentifier(user)
+            msg.to = self.bot_identifier  # assume it is for me
+            self.callback_message(msg)
+
+    def _error_callback(self, error, room):
+        log.error("Stream STOPPED due to ERROR: %s in room %s" % (error, room.name))
